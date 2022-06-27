@@ -1,0 +1,290 @@
+import logging
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+from rlberry.manager import AgentManager
+logger = logging.getLogger(__name__)
+
+def read_writer_data(data_source, tag, preprocess_func=None):
+    """
+    Given a list of AgentManager or a folder, read data (corresponding to info) obtained in each episode.
+    The dictionary returned by agents' .fit() method must contain a key equal to `info`.
+    Parameters
+    ----------
+    data_source : :class:`~rlberry.manager.AgentManager`, or list of :class:`~rlberry.manager.AgentManager` or str or list of str
+        - If AgentManager or list of AgentManager, load data from it (the agents must be fitted).
+        - If str, the string must be the string path of a directory,  each
+        subdirectory of this directory must contain pickle files.
+        Load the data from the directory of the latest experiment in date.
+        This str should be equal to the value of the `output_dir` parameter in
+            :class:`~rlberry.manager.AgentManager`.
+        - If list of str, each string must be a directory containing pickle files.
+            Load the data from these pickle files.
+        Note: the agent's save function must save its writer at the key `_writer`.
+        This is the default for rlberry agents.
+    tag :  str or list of str
+        Tag of data that we want to preprocess.
+    preprocess_func: Callable or None or list of Callable or None
+        Function to apply to 'tag' column before returning data.
+        For instance, if tag=episode_rewards,setting preprocess_func=np.cumsum
+        will return cumulative rewards
+        If None, do not preprocess.
+        If tag is a list, preprocess_func must be None or a list of Callable or
+        None that matches the length of tag.
+    Returns
+    -------
+    Pandas DataFrame with data from writers.
+    """
+    input_dir = None
+
+    if not isinstance(data_source, list):
+        if isinstance(data_source, AgentManager):
+            data_source = [data_source]
+        else:
+            take_last_date = True
+    else:
+        if not isinstance(data_source[0], AgentManager):
+            take_last_date = False
+            for dir in data_source:
+                files = list(Path(dir).iterdir())
+                if len(files) == 0:
+                    raise RuntimeError(
+                        "One of the files in data_source does not contain pickle files"
+                    )
+
+    if isinstance(data_source[0], AgentManager):
+        agent_manager_list = data_source
+    else:
+        input_dir = data_source
+
+    if isinstance(tag, str):
+        tags = [tag]
+        preprocess_funcs = [preprocess_func or (lambda x: x)]
+    else:
+        tags = tag
+        if preprocess_func is None:
+            preprocess_funcs = [lambda x: x for _ in range(len(tags))]
+        else:
+            assert len(preprocess_func) == len(tags)
+            preprocess_funcs = preprocess_func
+
+    writer_datas = []
+    if input_dir is not None:
+        if take_last_date:
+            subdirs = list((Path(input_dir) / "manager_data").iterdir())
+            agent_name_list = [str(p.stem).split("_")[0] for p in subdirs]
+            for name in agent_name_list:
+                filename, dir_name = _get_last_xp(input_dir, name)
+                writer_datas.append(_load_data(filename, dir_name))
+        else:
+            agent_name_list = [str(Path(p).stem).split("_")[0] for p in input_dir]
+            agent_dirs = [str(Path(p).parent).split("_")[0] for p in input_dir]
+
+            for id_f, filename in enumerate(input_dir):
+                writer_datas.append(_load_data(filename, agent_dirs[id_f]))
+    else:
+        for manager in agent_manager_list:
+            # Important: since manager can be a RemoteAgentManager,
+            # it is important to avoid repeated accesses to its methods and properties.
+            # That is why writer_data is taken from the manager instance only in
+            # the line below.
+            writer_datas.append(manager.get_writer_data())
+        agent_name_list = [manager.agent_name for manager in agent_manager_list]
+    # preprocess agent stats
+    data_list = []
+
+    for id_agent, agent_name in enumerate(agent_name_list):
+        writer_data = writer_datas[id_agent]
+        if writer_data is not None:
+            for idx in writer_data:
+                for id_tag, tag in enumerate(tags):
+                    df = writer_data[idx]
+                    processed_df = pd.DataFrame(df[df["tag"] == tag])
+                    processed_df["value"] = preprocess_funcs[id_tag](
+                        processed_df["value"].values
+                    )
+                    # update name according to AgentManager name and
+                    # n_simulation
+                    processed_df["name"] = agent_name
+                    processed_df["n_simu"] = idx
+                    # add column
+                    data_list.append(processed_df)
+    all_writer_data = pd.concat(data_list, ignore_index=True)
+    return all_writer_data
+
+
+
+def evaluate_agents(agent_manager_list,
+                    n_simulations=5,
+                    fignum=None,
+                    show=True,
+                    plot=True,
+                    sns_kwargs=None):
+    """
+    Evaluate and compare each of the agents in agent_manager_list.
+
+    Parameters
+    ----------
+    agent_manager_list : list of AgentManager objects.
+    n_simulations: int
+        Number of calls to the eval() method of each AgentManager instance.
+    fignum: string or int
+        Identifier of plot figure.
+    show: bool
+        If true, calls plt.show().
+    plot: bool
+        If false, do not plot.
+    sns_kwargs:
+        Extra parameters for sns.boxplot
+
+    Returns
+    -------
+    dataframe with the evaluation results.
+    """
+    sns_kwargs = sns_kwargs or {}
+
+    #
+    # evaluation
+    #
+
+    eval_outputs = []
+    for agent_manager in agent_manager_list:
+        logger.info(f'Evaluating {agent_manager.agent_name}...')
+        outputs = agent_manager.eval_agents(n_simulations)
+        if len(outputs) > 0:
+            eval_outputs.append(outputs)
+
+    if len(eval_outputs) == 0:
+        logger.error('[evaluate_agents]: No evaluation data. Make sure AgentManager.fit() has been called.')
+        return
+
+    #
+    # plot
+    #
+
+    # build unique agent IDs (in case there are two agents with the same ID)
+    unique_ids = []
+    id_count = {}
+    for agent_manager in agent_manager_list:
+        name = agent_manager.agent_name
+        if name not in id_count:
+            id_count[name] = 1
+        else:
+            id_count[name] += 1
+
+        unique_ids.append(name + "*" * (id_count[name] - 1))
+
+    # convert output to DataFrame
+    data = {}
+    for agent_id, out in zip(unique_ids, eval_outputs):
+        data[agent_id] = out
+    output = pd.DataFrame(data)
+
+    # plot
+    if plot:
+        plt.figure(fignum)
+        with sns.axes_style("whitegrid"):
+            ax = sns.boxplot(data=output, **sns_kwargs)
+            ax.set_xlabel("agent")
+            ax.set_ylabel("evaluation output")
+            if show:
+                plt.show()
+
+    return output
+
+
+def plot_writer_data(agent_manager,
+                     tag,
+                     xtag=None,
+                     fignum=None,
+                     show=True,
+                     preprocess_func=None,
+                     title=None,
+                     sns_kwargs=None):
+    """
+    Given a list of AgentManager, plot data (corresponding to info) obtained in each episode.
+    The dictionary returned by agents' .fit() method must contain a key equal to `info`.
+
+    Parameters
+    ----------
+    agent_manager : AgentManager, or list of AgentManager
+    tag : str
+        Tag of data to plot on y-axis.
+    xtag : str
+        Tag of data to plot on x-axis. If None, use 'global_step'.
+    fignum: string or int
+        Identifier of plot figure.
+    show: bool
+        If true, calls plt.show().
+    preprocess_func: Callable
+        Function to apply to 'tag' column before plot. For instance, if tag=episode_rewards,
+        setting preprocess_func=np.cumsum will plot cumulative rewards
+    title: str (Optional)
+        Optional title to plot. If None, set to tag.
+    sns_kwargs: dict
+        Optional extra params for seaborn lineplot.
+
+    Returns
+    -------
+    Pandas DataFrame with processed data used by seaborn's lineplot.
+    """
+    sns_kwargs = sns_kwargs or {'ci': 'sd'}
+
+    title = title or tag
+    if preprocess_func is not None:
+        ylabel = 'value'
+    else:
+        ylabel = tag
+    preprocess_func = preprocess_func or (lambda x: x)
+    agent_manager_list = agent_manager
+    if not isinstance(agent_manager_list, list):
+        agent_manager_list = [agent_manager_list]
+
+    # preprocess agent stats
+    data_list = []
+    for manager in agent_manager_list:
+        # Important: since manager can be a RemoteAgentManager,
+        # it is important to avoid repeated accesses to its methods and properties.
+        # That is why writer_data is taken from the manager instance only in the line below.
+        writer_data = manager.get_writer_data()
+        agent_name = manager.agent_name
+        if writer_data is not None:
+            for idx in writer_data:
+                df = writer_data[idx]
+                processed_df = pd.DataFrame(df[df['tag'] == tag])
+                processed_df['value'] = preprocess_func(processed_df['value'].values)
+                # update name according to AgentManager name
+                processed_df['name'] = agent_name
+                # add column with xtag, if given
+                if xtag is not None:
+                    df_xtag = pd.DataFrame(df[df['tag'] == xtag])
+                    processed_df[xtag] = df_xtag['value'].values
+                data_list.append(processed_df)
+    if len(data_list) == 0:
+        logger.error('[plot_writer_data]: No data to be plotted.')
+        return
+
+    all_writer_data = pd.concat(data_list, ignore_index=True)
+
+    data = all_writer_data[all_writer_data['tag'] == tag]
+    if xtag is None:
+        xtag = 'global_step'
+
+    if data[xtag].notnull().sum() > 0:
+        xx = xtag
+        if data['global_step'].isna().sum() > 0:
+            logger.warning(f'Plotting {tag} vs {xtag}, but {xtag} might be missing for some agents.')
+    else:
+        xx = data.index
+
+    plt.figure(fignum)
+    lineplot_kwargs = dict(x=xx, y='value', hue='name', style='name', data=data)
+    lineplot_kwargs.update(sns_kwargs)
+    sns.lineplot(**lineplot_kwargs)
+    plt.title(title)
+    plt.ylabel(ylabel)
+
+    if show:
+        plt.show()
+
+    return data
